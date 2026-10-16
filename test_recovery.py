@@ -30,13 +30,15 @@ class Guards(unittest.TestCase):
         return env, event
 
     def configuration(self):
-        item = {"port": 25439, "volume": "example-data", "network": "example-net"}
+        item = {"volume": "example-data", "network": "example-net", "network_id": "synthetic-network-id"}
         obj = {"HostConfig": {"Memory": recovery.MEMORY, "MemorySwap": recovery.MEMORY,
                "NanoCpus": 1_000_000_000, "PidsLimit": 128, "ShmSize": 64*1024**2,
                "IpcMode": "private", "Privileged": False, "NetworkMode": item["network"],
                "RestartPolicy": {"Name": "no"}, "LogConfig": {"Type": "none"},
                "SecurityOpt": ["no-new-privileges:true"],
-               "PortBindings": {"5432/tcp": [{"HostIp": "127.0.0.1", "HostPort": "25439"}]}},
+               "PortBindings": {}, "PublishAllPorts": False},
+               "Config": {"ExposedPorts": {"5432/tcp": {}}},
+               "NetworkSettings": {"Ports": {}, "Networks": {item["network"]: {"NetworkID": item["network_id"]}}},
                "Mounts": [{"Name": item["volume"], "Type": "volume", "Destination": "/var/lib/postgresql/data"}]}
         return obj, item
 
@@ -73,12 +75,12 @@ class Guards(unittest.TestCase):
         event["repository"]["private"] = True
         self.assertFalse(preflight.context_ok(env, event))
 
-    def test_only_loopback_is_accepted(self):
+    def test_all_host_publication_is_rejected(self):
         obj, item = self.configuration()
         self.assertTrue(recovery.configuration_ok(obj, item))
-        for address in ("", "0.0.0.0", "::", "::1"):
+        for address in ("127.0.0.1", "", "0.0.0.0", "::", "::1"):
             changed = copy.deepcopy(obj)
-            changed["HostConfig"]["PortBindings"]["5432/tcp"][0]["HostIp"] = address
+            changed["HostConfig"]["PortBindings"] = {"5432/tcp": [{"HostIp": address, "HostPort": "25439"}]}
             with self.subTest(address=address):
                 self.assertFalse(recovery.configuration_ok(changed, item))
 
@@ -111,14 +113,14 @@ class Diagnostics(unittest.TestCase):
         # Constructor only: no files, credentials, Docker, keys or databases.
         with mock.patch.dict(recovery.os.environ, {"RUNNER_TEMP": "/unused-synthetic-path"}):
             example = recovery.Example({"origin": {"mono": time.monotonic()}})
-        example.stage = "source_port_binding"
+        example.stage = "source_zero_publication"
         return example
 
     def report(self, *, failure=None, cleanup=True):
         example = self.example()
         def execute():
             if failure == "guard":
-                example.check("explicit_loopback_only", False)
+                example.check("zero_published_ports", False)
             if failure == "unexpected":
                 raise RuntimeError("do-not-emit-this")
         def clean():
@@ -146,9 +148,9 @@ class Diagnostics(unittest.TestCase):
         self.assertTrue(result["cleanup_verified"])
         failed = [entry for entry in result["check_results"] if not entry["passed"]]
         self.assertEqual(result["failed_checks"], failed)
-        self.assertEqual([entry["check"] for entry in failed], ["explicit_loopback_only", "execution_completed"])
-        self.assertTrue(all(entry["stage"] == "source_port_binding" for entry in failed))
-        self.assertEqual(result["execution_stage"], "source_port_binding")
+        self.assertEqual([entry["check"] for entry in failed], ["zero_published_ports", "execution_completed"])
+        self.assertTrue(all(entry["stage"] == "source_zero_publication" for entry in failed))
+        self.assertEqual(result["execution_stage"], "source_zero_publication")
         self.assertEqual(result["failures"][0]["category"], "CHECK_REJECTED")
 
     def test_cleanup_failure_still_rejects_success(self):
@@ -198,18 +200,17 @@ class Diagnostics(unittest.TestCase):
         example = self.example()
         obj, item = Guards().configuration()
         item.update(kind="container", id="synthetic", started=True)
-        obj.update(State={"Running": True, "OOMKilled": False},
-                   NetworkSettings={"Networks": {item["network"]: {}}, "Ports": {}})
-        example.owned = [item]
-        example.done = mock.Mock()
+        obj.update(State={"Running": True, "OOMKilled": False})
+        obj["NetworkSettings"]["Ports"] = {"5432/tcp": [{"HostIp": "127.0.0.1", "HostPort": "25439"}]}
+        example.owned, example.done = [item], mock.Mock()
         example.done.wait.return_value = False
         with mock.patch.object(example, "sample"), mock.patch.object(example, "inspect", return_value=obj), \
              mock.patch.object(example, "stop_owned") as stop:
             example.watch()
         self.assertTrue(example.abort.is_set())
         stop.assert_called_once_with()
-        self.assertEqual(example.failures[0], {"stage": "source_port_binding", "origin": "watchdog",
-                         "category": "SAFETY_CHECK_FAILED", "check": "watchdog_loopback_port_binding"})
+        self.assertEqual(example.failures[0], {"stage": "source_zero_publication", "origin": "watchdog",
+                         "category": "SAFETY_CHECK_FAILED", "check": "watchdog_zero_publication"})
 
     def test_safe_error_categories_never_echo_values(self):
         sentinel = "do-not-emit-this"
@@ -232,213 +233,373 @@ class Diagnostics(unittest.TestCase):
                 self.assertNotIn(sentinel, json.dumps(example.failures))
 
 
-class BindingDiagnostics(unittest.TestCase):
-    def configuration(self):
+class ZeroPublication(unittest.TestCase):
+    def configuration(self, example=None):
+        example = example or Diagnostics().example()
         obj, item = Guards().configuration()
-        obj.update(State={"Running": True}, NetworkSettings={"Ports": copy.deepcopy(obj["HostConfig"]["PortBindings"]),
-                                                            "Networks": {item["network"]: {}}})
-        obj["HostConfig"]["PublishAllPorts"] = False
-        net = {"Driver": "bridge", "Internal": True, "EnableIPv6": False,
-               "Options": {"com.docker.network.bridge.gateway_mode_ipv4": "nat"}}
-        return obj, item, net
+        prefix = "pg-example-"+example.tag[:12]+"-source"
+        item.update(network=prefix+"-net", volume=prefix+"-data", kind="container", id="synthetic", started=True)
+        obj["HostConfig"]["NetworkMode"] = item["network"]
+        obj["Mounts"][0]["Name"] = item["volume"]
+        obj["NetworkSettings"]["Networks"] = {item["network"]: {"NetworkID": item["network_id"]}}
+        obj.update(Id=item["id"], Image="synthetic-image", State={"Running": True, "OOMKilled": False})
+        obj["Config"]["Labels"] = {"synthetic.recovery": example.tag}
+        net = {"Name": item["network"], "Id": item["network_id"], "Driver": "bridge", "Internal": True,
+               "EnableIPv6": False, "Labels": {"synthetic.recovery": example.tag}}
+        return example, obj, item, net
 
-    def binding_cases(self):
-        row = {"HostIp": "127.0.0.1", "HostPort": "25439"}
-        cases = [("missing", mock.sentinel.missing, "MISSING_PORT_MAPPING"),
-                 ("null", None, "MISSING_PORT_MAPPING"), ("empty", {}, "MISSING_PORT_MAPPING"),
-                 ("null_rows", {"5432/tcp": None}, "MISSING_PORT_MAPPING"),
-                 ("empty_rows", {"5432/tcp": []}, "MISSING_PORT_MAPPING")]
-        for label, value in (("list_map", []), ("string_map", "do-not-emit-this"),
-                             ("object_rows", {"5432/tcp": row}), ("scalar_row", {"5432/tcp": [None]}),
-                             ("missing_field", {"5432/tcp": [{"HostIp": "127.0.0.1"}]}),
-                             ("extra_field", {"5432/tcp": [{**row, "extra": "do-not-emit-this"}]})):
-            cases.append((label, value, "UNEXPECTED_MAPPING_STRUCTURE"))
-        for label, value in (("extra_null_port", {"5432/tcp": [row], "5433/tcp": None}),
-                             ("extra_published_port", {"5432/tcp": [row], "5433/tcp": [row]}),
-                             ("duplicate_binding", {"5432/tcp": [row, row]}),
-                             ("extra_wildcard", {"5432/tcp": [row, {**row, "HostIp": "0.0.0.0"}]})):
-            cases.append((label, value, "ADDITIONAL_MAPPING_ENTRIES"))
-        for value in ("0.0.0.0", "::", "::1", "127.0.0.2", "", None, {"secret": "do-not-emit-this"}):
-            cases.append(("host_ip_"+str(len(cases)), {"5432/tcp": [{**row, "HostIp": value}]}, "UNEXPECTED_HOST_IP"))
-        for value in ("25440", 25439, "025439", "", None, True, "do-not-emit-this"):
-            cases.append(("host_port_"+str(len(cases)), {"5432/tcp": [{**row, "HostPort": value}]}, "HOST_PORT_MISMATCH"))
+    def cases(self):
+        cases = []
+        def add(label, path, value, reason):
+            cases.append((label, path, value, reason))
+        for field in ("HostConfig", "Config", "NetworkSettings"):
+            for label, value in (("missing", mock.sentinel.missing), ("null", None),
+                                 ("list", []), ("string", "do-not-emit-this")):
+                add(field+"_"+label, (field,), value, "MISSING_OR_INVALID_INSPECTION")
+        for field in (("HostConfig", "PortBindings"), ("HostConfig", "PublishAllPorts"),
+                      ("Config", "ExposedPorts"), ("NetworkSettings", "Ports")):
+            add("missing_"+field[-1], field, mock.sentinel.missing, "MISSING_OR_INVALID_INSPECTION")
+        for value in ([], "do-not-emit-this", {"5432/tcp": None}, {"5432/tcp": []}):
+            reason = "CONFIGURED_PORT_PUBLICATION" if type(value) is dict else "MISSING_OR_INVALID_INSPECTION"
+            add("configured_"+str(len(cases)), ("HostConfig", "PortBindings"), value, reason)
+        for address in ("127.0.0.1", "0.0.0.0", "::", "::1", "", None):
+            binding = {"5432/tcp": [{"HostIp": address, "HostPort": "25439"}]}
+            add("configured_address_"+str(len(cases)), ("HostConfig", "PortBindings"), binding, "CONFIGURED_PORT_PUBLICATION")
+            add("runtime_address_"+str(len(cases)), ("NetworkSettings", "Ports"), binding, "RUNTIME_PORT_PUBLICATION")
+        for value in (True, None, 0, "false", []):
+            add("publish_all_"+str(len(cases)), ("HostConfig", "PublishAllPorts"), value, "PUBLISH_ALL_PORTS")
+        for value in (None, [], {}, {"5432/tcp": None}, {"5432/tcp": {"extra": "do-not-emit-this"}},
+                      {"5432/tcp": {}, "5433/tcp": {}}):
+            add("expose_"+str(len(cases)), ("Config", "ExposedPorts"), value, "UNEXPECTED_EXPOSE_METADATA")
+        for value in (None, [], "do-not-emit-this", {"5433/tcp": None}, {"5432/tcp": None, "5433/tcp": None}):
+            reason = "UNEXPECTED_RUNTIME_PORTS" if type(value) is dict else "MISSING_OR_INVALID_INSPECTION"
+            add("runtime_shape_"+str(len(cases)), ("NetworkSettings", "Ports"), value, reason)
+        for value in ({"5432/tcp": []}, {"5432/tcp": {}}, {"5432/tcp": "do-not-emit-this"},
+                      {"5432/tcp": [{"HostIp": "127.0.0.1", "HostPort": "25439"}]*2}):
+            add("runtime_binding_"+str(len(cases)), ("NetworkSettings", "Ports"), value, "RUNTIME_PORT_PUBLICATION")
         return cases
 
-    def test_shared_guard_reports_fixed_reasons_without_broadening_acceptance(self):
-        obj, item, net = self.configuration()
-        expected = copy.deepcopy(obj["NetworkSettings"]["Ports"])
-        self.assertIsNone(recovery.loopback_binding_reason(obj, item))
-        for label, value, reason in self.binding_cases():
-            with self.subTest(case=label):
-                if value is mock.sentinel.missing:
-                    obj["NetworkSettings"].pop("Ports", None)
-                else:
-                    obj["NetworkSettings"]["Ports"] = value
-                self.assertEqual(recovery.loopback_binding_reason(obj, item), reason)
-                self.assertNotEqual(obj["NetworkSettings"].get("Ports"), expected)
+    def change(self, obj, path, value):
+        parent = obj
+        for part in path[:-1]:
+            parent = parent[part]
+        if value is mock.sentinel.missing:
+            del parent[path[-1]]
+        else:
+            parent[path[-1]] = value
 
-    def test_main_and_watchdog_reject_the_same_cases_with_the_same_reason(self):
-        for label, value, reason in self.binding_cases():
+    def test_only_unpublished_expose_metadata_is_accepted(self):
+        _, obj, item, _ = self.configuration()
+        for configured in ({}, None):
+            for runtime in ({}, {"5432/tcp": None}):
+                with self.subTest(configured=configured, runtime=runtime):
+                    obj["HostConfig"]["PortBindings"] = configured
+                    obj["NetworkSettings"]["Ports"] = runtime
+                    self.assertIsNone(recovery.zero_publication_reason(obj))
+                    self.assertTrue(recovery.configuration_ok(obj, item))
+
+    def test_invalid_and_published_inspection_is_rejected_with_fixed_reasons(self):
+        for label, path, value, reason in self.cases():
             with self.subTest(case=label):
-                example = Diagnostics().example()
-                example.image_id = "synthetic-image"
-                prefix = "pg-example-"+example.tag[:12]+"-source"
-                obj, item, net = self.configuration()
-                item.update(network=prefix+"-net", volume=prefix+"-data", kind="container", id="synthetic", started=True)
-                obj["HostConfig"]["NetworkMode"] = item["network"]
-                obj["Mounts"][0]["Name"] = item["volume"]
-                obj.update(Id=item["id"], Image=example.image_id, Config={"Labels": {"synthetic.recovery": example.tag}})
-                obj["State"]["OOMKilled"] = False
-                obj["NetworkSettings"]["Networks"] = {item["network"]: {}}
-                if value is mock.sentinel.missing:
-                    obj["NetworkSettings"].pop("Ports")
-                else:
-                    obj["NetworkSettings"]["Ports"] = value
+                _, obj, _, _ = self.configuration()
+                self.change(obj, path, value)
+                self.assertEqual(recovery.zero_publication_reason(obj), reason)
+                self.assertNotIn("do-not-emit-this", reason)
+        for obj in (None, [], "do-not-emit-this"):
+            self.assertEqual(recovery.zero_publication_reason(obj), "MISSING_OR_INVALID_INSPECTION")
+
+    def test_main_and_watchdog_reject_the_same_zero_publication_cases(self):
+        for label, path, value, reason in self.cases():
+            with self.subTest(case=label):
+                example, obj, item, net = self.configuration()
+                example.image_id = obj["Image"]
+                self.change(obj, path, value)
                 with mock.patch.object(example, "create"), mock.patch.object(example, "journal"), \
                      mock.patch.object(example, "docker", return_value=(1, b"")), \
-                     mock.patch.object(example, "inspect", side_effect=[net, obj, obj]), \
-                     mock.patch.object(example, "query") as query, mock.patch.object(recovery.socket, "socket"), \
+                     mock.patch.object(example, "inspect", side_effect=lambda kind, identifier: net if kind == "network" else obj), \
+                     mock.patch.object(example, "query") as query, \
                      mock.patch.object(recovery.secrets, "token_urlsafe", return_value="unused-synthetic-value"):
                     with self.assertRaises(RuntimeError):
-                        example.database("source", 25439)
+                        example.database("source")
                 query.assert_not_called()
-                self.assertEqual(example.checks[-1]["check"], "explicit_loopback_only")
-                self.assertFalse(example.checks[-1]["passed"])
-                self.assertEqual(example.binding_diagnostics[0]["reason"], reason)
-                watch = Diagnostics().example()
-                watch.owned, watch.done = [item], mock.Mock()
+                rejected = [entry["check"] for entry in example.checks if not entry["passed"]]
+                self.assertTrue(any(name.startswith("zero_published_ports") for name in rejected), rejected)
+                watch, obj2, watch_item, watch_net = self.configuration()
+                self.change(obj2, path, value)
+                watch.owned, watch.done = [watch_item], mock.Mock()
                 watch.done.wait.return_value = False
-                with mock.patch.object(watch, "sample"), mock.patch.object(watch, "inspect", return_value=obj), \
+                with mock.patch.object(watch, "sample"), \
+                     mock.patch.object(watch, "inspect", side_effect=lambda kind, identifier: watch_net if kind == "network" else obj2), \
                      mock.patch.object(watch, "stop_owned") as stop:
                     watch.watch()
                 self.assertTrue(watch.abort.is_set())
                 stop.assert_called_once_with()
-                self.assertEqual(watch.failures[0]["check"], "watchdog_loopback_port_binding")
-                self.assertEqual(watch.binding_diagnostics[0]["reason"], reason)
-                self.assertNotIn("do-not-emit-this", json.dumps(example.binding_diagnostics+watch.binding_diagnostics))
+                self.assertEqual(watch.failures[0]["check"], "watchdog_zero_publication")
+                self.assertNotIn("do-not-emit-this", json.dumps(watch.failures))
 
-    def test_malformed_parent_fields_do_not_hide_sanitized_diagnostics(self):
-        obj, item, net = self.configuration()
-        for field in ("HostConfig", "NetworkSettings", "State"):
-            for value in (None, [], "do-not-emit-this"):
-                changed = copy.deepcopy(obj)
-                changed[field] = value
-                self.assertNotIn("do-not-emit-this", json.dumps(recovery.binding_diagnostic(changed, item, net)))
-                if field == "NetworkSettings":
-                    self.assertEqual(recovery.loopback_binding_reason(changed, item),
-                                     "MISSING_PORT_MAPPING" if value is None else "UNEXPECTED_MAPPING_STRUCTURE")
-        obj["NetworkSettings"]["Networks"] = None
-        self.assertFalse(recovery.binding_diagnostic(obj, item, net)["only_owned_network"])
+    def test_runtime_inspection_is_rechecked_after_start_before_fixtures(self):
+        for label, path, value, reason in self.cases():
+            if path[0] != "NetworkSettings":
+                continue
+            with self.subTest(case=label):
+                example, runtime, item, net = self.configuration()
+                example.image_id = runtime["Image"]
+                before_start = copy.deepcopy(runtime)
+                self.change(runtime, path, value)
+                inspections = iter((before_start, runtime))
+                with mock.patch.object(example, "create"), mock.patch.object(example, "journal"), \
+                     mock.patch.object(example, "docker", return_value=(1, b"")), \
+                     mock.patch.object(example, "inspect", side_effect=lambda kind, identifier: net if kind == "network" else next(inspections)), \
+                     mock.patch.object(example, "query") as query, \
+                     mock.patch.object(example, "verify_postgres") as verify:
+                    with self.assertRaises(RuntimeError):
+                        example.database("source")
+                query.assert_not_called()
+                verify.assert_not_called()
+                self.assertEqual(example.checks[-1]["check"], "zero_published_ports")
+                self.assertFalse(example.checks[-1]["passed"])
+                self.assertEqual(example.binding_diagnostics[-1]["reason"], reason)
 
-    def test_absent_null_and_empty_mappings_remain_distinguishable(self):
-        obj, item, net = self.configuration()
-        del obj["NetworkSettings"]["Ports"]
-        missing = recovery.binding_diagnostic(obj, item, net)
-        self.assertFalse(missing["runtime_present"])
-        for value in (None, {}, {"5432/tcp": None}, {"5432/tcp": []}):
-            obj["NetworkSettings"]["Ports"] = value
-            snapshot = recovery.binding_diagnostic(obj, item, net)
-            self.assertTrue(snapshot["runtime_present"])
-            if value is None:
-                self.assertIsNone(snapshot["runtime"])
-            elif not value:
-                self.assertEqual(snapshot["runtime"], {"entries": [], "count": 0})
-            else:
-                self.assertEqual(snapshot["runtime"]["entries"][0]["bindings"], value["5432/tcp"])
+    def test_external_network_added_after_start_prevents_fixtures(self):
+        example, runtime, item, net = self.configuration()
+        example.image_id = runtime["Image"]
+        before_start = copy.deepcopy(runtime)
+        runtime["NetworkSettings"]["Networks"]["external"] = {"NetworkID": "other-network"}
+        inspections = iter((before_start, runtime))
+        with mock.patch.object(example, "create"), mock.patch.object(example, "journal"), \
+             mock.patch.object(example, "docker", return_value=(1, b"")), \
+             mock.patch.object(example, "inspect", side_effect=lambda kind, identifier: net if kind == "network" else next(inspections)), \
+             mock.patch.object(example, "query") as query, \
+             mock.patch.object(example, "verify_postgres") as verify:
+            with self.assertRaises(RuntimeError):
+                example.database("source")
+        self.assertEqual(example.checks[-1]["check"], "only_owned_internal_network")
+        self.assertFalse(example.checks[-1]["passed"])
+        query.assert_not_called()
+        verify.assert_not_called()
 
-    def test_addresses_and_safe_representation_differences_are_observable(self):
-        obj, item, net = self.configuration()
-        expected = {"5432/tcp": [{"HostIp": "127.0.0.1", "HostPort": "25439"}]}
-        for address in ("127.0.0.1", "0.0.0.0", "::", "::1", "", "192.0.2.1"):
-            obj["NetworkSettings"]["Ports"] = {"5432/tcp": [{"HostIp": address, "HostPort": "25439"}]}
-            snapshot = recovery.binding_diagnostic(obj, item, net)
-            self.assertEqual(snapshot["runtime"]["entries"][0]["bindings"][0]["HostIp"], address)
-            example = Diagnostics().example()
-            if address == "127.0.0.1":
-                example.check("explicit_loopback_only", obj["NetworkSettings"]["Ports"] == expected)
-            else:
-                with self.assertRaises(RuntimeError):
-                    example.check("explicit_loopback_only", obj["NetworkSettings"]["Ports"] == expected)
-        obj["NetworkSettings"]["Ports"] = {"5432/tcp": [{"HostIp": "127.0.0.1", "HostPort": 25439}]}
-        snapshot = recovery.binding_diagnostic(obj, item, net)
-        self.assertIs(type(snapshot["runtime"]["entries"][0]["bindings"][0]["HostPort"]), int)
-        self.assertNotEqual(obj["NetworkSettings"]["Ports"], expected)
-        obj["NetworkSettings"]["Ports"] = {**expected, "5433/tcp": None}
-        self.assertEqual(recovery.binding_diagnostic(obj, item, net)["runtime"]["count"], 2)
-        self.assertNotEqual(obj["NetworkSettings"]["Ports"], expected)
+    def test_watchdog_accepts_only_the_valid_unpublished_owned_network(self):
+        for configured in ({}, None):
+            for runtime in ({}, {"5432/tcp": None}):
+                example, obj, item, net = self.configuration()
+                obj["HostConfig"]["PortBindings"] = configured
+                obj["NetworkSettings"]["Ports"] = runtime
+                example.owned, example.done = [item], mock.Mock()
+                example.done.wait.side_effect = (False, True)
+                with mock.patch.object(example, "sample"), \
+                     mock.patch.object(example, "inspect", side_effect=lambda kind, identifier: net if kind == "network" else obj), \
+                     mock.patch.object(example, "stop_owned") as stop:
+                    example.watch()
+                self.assertFalse(example.abort.is_set())
+                self.assertEqual(example.failures, [])
+                stop.assert_not_called()
 
-    def test_snapshot_redacts_sensitive_and_unrecognized_data_and_bounds_output(self):
-        obj, item, net = self.configuration()
+    def test_network_must_remain_owned_internal_bridge_with_ipv6_disabled(self):
+        for key, value in (("Name", "external"), ("Id", ""), ("Driver", "host"), ("Driver", None),
+                           ("Internal", False), ("Internal", 1), ("EnableIPv6", True), ("EnableIPv6", None),
+                           ("Labels", {}), ("Labels", {"synthetic.recovery": "other"})):
+            with self.subTest(key=key, value=value):
+                example, obj, item, net = self.configuration()
+                net[key] = value
+                self.assertFalse(recovery.internal_network_ok(net, item["network"], example.tag))
+                self.assertFalse(recovery.isolated_network_ok(obj, item, net, example.tag))
+        for key in ("Name", "Id", "Driver", "Internal", "EnableIPv6", "Labels"):
+            example, obj, item, net = self.configuration()
+            del net[key]
+            self.assertFalse(recovery.internal_network_ok(net, item["network"], example.tag))
+        for value in (None, [], "do-not-emit-this"):
+            self.assertFalse(recovery.internal_network_ok(value, "synthetic-net", "synthetic-tag"))
+
+    def test_container_rejects_external_or_malformed_network_attachment(self):
+        for value in (None, [], {}, {"external": {}}, {"own": {}, "external": {}},
+                      "do-not-emit-this"):
+            example, obj, item, net = self.configuration()
+            obj["NetworkSettings"]["Networks"] = value
+            self.assertFalse(recovery.isolated_network_ok(obj, item, net, example.tag))
+        for endpoint in (None, [], {}, {"NetworkID": "other"}, {"NetworkID": None}):
+            example, obj, item, net = self.configuration()
+            obj["NetworkSettings"]["Networks"] = {item["network"]: endpoint}
+            self.assertFalse(recovery.isolated_network_ok(obj, item, net, example.tag))
+        example, obj, item, net = self.configuration()
+        self.assertTrue(recovery.isolated_network_ok(obj, item, net, example.tag))
+        obj["NetworkSettings"]["Networks"]["external"] = {"NetworkID": "external"}
+        self.assertFalse(recovery.isolated_network_ok(obj, item, net, example.tag))
+        del obj["NetworkSettings"]["Networks"]["external"]
+        item["network_id"] = "other"
+        self.assertFalse(recovery.isolated_network_ok(obj, item, net, example.tag))
+
+    def test_watchdog_stops_after_network_is_changed(self):
+        for field, value in (("Internal", False), ("EnableIPv6", True), ("Labels", {})):
+            example, obj, item, net = self.configuration()
+            net[field] = value
+            example.owned, example.done = [item], mock.Mock()
+            example.done.wait.return_value = False
+            with mock.patch.object(example, "sample"), \
+                 mock.patch.object(example, "inspect", side_effect=lambda kind, identifier: net if kind == "network" else obj), \
+                 mock.patch.object(example, "stop_owned") as stop:
+                example.watch()
+            self.assertTrue(example.abort.is_set())
+            stop.assert_called_once_with()
+            self.assertEqual(example.failures[0]["check"], "watchdog_owned_internal_network")
+
+    def test_diagnostics_remain_sanitized_bounded_and_survive_final_report(self):
+        example, obj, item, net = self.configuration()
         sentinel = "do-not-emit-this"
-        obj.update(Config={"Env": [sentinel], "Labels": {sentinel: sentinel}}, Name=sentinel)
+        obj["Config"].update(Env=[sentinel], Labels={sentinel: sentinel})
         obj["State"]["Error"] = sentinel
         obj["HostConfig"].update(Binds=[sentinel], NetworkMode=sentinel)
         obj["NetworkSettings"]["Ports"] = {sentinel: [{"HostIp": sentinel, "HostPort": sentinel, "extra": sentinel}]}
-        net.update(Name=sentinel, IPAM={sentinel: sentinel})
-        net["Options"].update({sentinel: sentinel, "com.docker.network.bridge.gateway_mode_ipv6": {sentinel: sentinel}})
+        net.update(Name=sentinel, IPAM={sentinel: sentinel}, Options={sentinel: sentinel})
         snapshot = recovery.binding_diagnostic(obj, item, net)
         self.assertNotIn(sentinel, json.dumps(snapshot))
         self.assertTrue(snapshot["network_internal"])
-        self.assertFalse(snapshot["publish_all_ports"])
         obj["NetworkSettings"]["Ports"] = {str(p)+"/tcp": [{"HostIp": "127.0.0.1", "HostPort": "25439"}]*20
                                            for p in range(1, 21)}
         bounded = recovery.binding_diagnostic(obj, item, net)["runtime"]
         self.assertEqual(bounded["count"], 20)
         self.assertEqual(len(bounded["entries"]), 8)
         self.assertTrue(all(len(v["bindings"]) == 8 and v["binding_count"] == 20 for v in bounded["entries"]))
-
-    def test_real_guard_path_captures_same_inspection_before_fixture_work(self):
-        example = Diagnostics().example()
-        example.image_id = "synthetic-image"
-        prefix = "pg-example-"+example.tag[:12]+"-source"
-        obj, item, net = self.configuration()
-        item.update(network=prefix+"-net", volume=prefix+"-data")
-        obj["HostConfig"]["NetworkMode"] = item["network"]
-        obj["Mounts"][0]["Name"] = item["volume"]
-        obj.update(Id="synthetic-container", Image=example.image_id, Config={"Labels": {"synthetic.recovery": example.tag}})
-        obj["NetworkSettings"].update(Ports={}, Networks={item["network"]: {}})
-        with mock.patch.object(example, "create"), mock.patch.object(example, "journal"), \
-             mock.patch.object(example, "docker", return_value=(1, b"")), \
-             mock.patch.object(example, "inspect", side_effect=[net, obj, obj]) as inspect, \
-             mock.patch.object(example, "query") as query, mock.patch.object(recovery.socket, "socket"), \
-             mock.patch.object(recovery.secrets, "token_urlsafe", return_value="unused-synthetic-value"):
-            with self.assertRaises(RuntimeError):
-                example.database("source", 25439)
-        self.assertEqual(inspect.call_count, 3)  # No extra inspect commands were added.
-        query.assert_not_called()
-        self.assertEqual(example.checks[-1], {"check": "explicit_loopback_only", "passed": False, "stage": "source_port_binding"})
-        self.assertEqual(example.binding_diagnostics[0]["runtime"], {"entries": [], "count": 0})
-        self.assertTrue(example.binding_diagnostics[0]["network_internal"])
-
-    def test_watchdog_binding_failure_captures_snapshot_and_still_stops(self):
-        example = Diagnostics().example()
-        obj, item, net = self.configuration()
-        item.update(kind="container", id="synthetic", started=True)
-        obj["State"]["OOMKilled"] = False
-        obj["NetworkSettings"]["Ports"]["5432/tcp"][0]["HostIp"] = "0.0.0.0"
-        example.owned, example.done = [item], mock.Mock()
-        example.done.wait.return_value = False
-        with mock.patch.object(example, "sample"), mock.patch.object(example, "inspect", return_value=obj), \
-             mock.patch.object(example, "stop_owned") as stop:
-            example.watch()
-        self.assertTrue(example.abort.is_set())
-        stop.assert_called_once_with()
-        self.assertEqual(example.binding_diagnostics[0]["origin"], "watchdog")
-        self.assertEqual(example.binding_diagnostics[0]["runtime"]["entries"][0]["bindings"][0]["HostIp"], "0.0.0.0")
-
-    def test_binding_snapshot_survives_cleanup_and_is_in_final_failed_report(self):
+        example.binding_diagnostics.append({"stage": example.stage, "origin": "main", **snapshot})
         case = Diagnostics()
-        example = case.example()
-        obj, item, net = self.configuration()
-        example.binding_diagnostics.append({"stage": "source_port_binding", "origin": "main",
-                                            **recovery.binding_diagnostic(obj, item, net)})
         with mock.patch.object(case, "example", return_value=example):
             code, result, raw = case.report(failure="guard")
         self.assertEqual(code, 2)
-        self.assertEqual(result["status"], "INCOMPLETE_NOT_ACCEPTED")
         self.assertEqual(result["binding_diagnostics"], example.binding_diagnostics)
+        self.assertNotIn(sentinel, raw)
         self.assertTrue(result["cleanup_verified"])
+
+    def test_database_creation_has_no_host_port_and_retains_authentication(self):
+        example, obj, item, net = self.configuration()
+        example.image_id = obj["Image"]
+        example.abort = mock.Mock()
+        example.abort.wait.return_value = False
+        limits = (str(recovery.MEMORY)+"\n0\n100000 100000\n128\n").encode()
+        def docker(*args, **options):
+            if args[:2] == ("container", "inspect"):
+                return 1, b""
+            if args[0] == "exec" and "sh" in args:
+                return 0, limits
+            return 0, b""
+        with mock.patch.object(example, "create") as create, mock.patch.object(example, "journal"), \
+             mock.patch.object(example, "docker", side_effect=docker) as command, \
+             mock.patch.object(example, "inspect", side_effect=lambda kind, identifier: net if kind == "network" else obj), \
+             mock.patch.object(example, "sample"), mock.patch.object(example, "verify_postgres") as verify, \
+             mock.patch.object(example, "query") as query, \
+             mock.patch.object(recovery.secrets, "token_urlsafe", return_value="unused-synthetic-value"):
+            returned = example.database("source")
+        creates = [call.args for call in command.call_args_list if call.args[0] == "create"]
+        self.assertEqual(len(creates), 1)
+        args = creates[0]
+        self.assertNotIn("--publish", args)
+        self.assertNotIn("-p", args)
+        self.assertNotIn("-P", args)
+        self.assertNotIn("--publish-all", args)
+        self.assertIn("listen_addresses=127.0.0.1", args)
+        self.assertIn("password_encryption=scram-sha-256", args)
+        self.assertIn("POSTGRES_HOST_AUTH_METHOD=scram-sha-256", args)
+        self.assertIn("POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256", args)
+        self.assertIn("--internal", create.call_args_list[0].args[2])
+        self.assertNotIn("port", returned)
+        verify.assert_called_once_with(returned)
+        query.assert_called_once_with(returned, "postgres", "CREATE DATABASE specimen;")
+        self.assertEqual(example.abort.wait.call_count, 30)
+
+
+class PostgresAuthentication(unittest.TestCase):
+    def expected(self):
+        return ["127.0.0.1", "127.0.0.1", 5432, "postgres", "postgres", "scram-sha-256", True, True, True]
+
+    def verify(self, result=None, negative=(2, b"")):
+        example = Diagnostics().example()
+        item = {"id": "synthetic-container"}
+        example.passwords[item["id"]] = "unused-synthetic-value"
+        result = self.expected() if result is None else result
+        output = json.dumps(result).encode()
+        with mock.patch.object(example, "query", return_value=(0, output)) as query, \
+             mock.patch.object(example, "docker", return_value=negative) as docker, \
+             mock.patch.object(recovery.secrets, "token_urlsafe", return_value="unused-incorrect-value"):
+            example.verify_postgres(item)
+        return example, query, docker
+
+    def test_effective_loopback_tcp_connection_and_scram_are_all_checked(self):
+        example, query, docker = self.verify()
+        self.assertEqual([row["check"] for row in example.checks],
+                         ["postgres_settings_readable", "postgres_loopback_listening", "authenticated_sql_connection",
+                          "scram_authentication_required", "incorrect_password_rejected"])
+        self.assertTrue(all(row["passed"] for row in example.checks))
+        sql = query.call_args.args[2]
+        for token in ("listen_addresses", "host(inet_server_addr())", "inet_server_port", "password_encryption",
+                      "pg_hba_file_rules", "rolpassword"):
+            self.assertIn(token, sql)
+        probe = docker.call_args.args
+        self.assertEqual(probe[0], "exec")
+        self.assertIn("psql", probe)
+        self.assertIn("127.0.0.1", probe)
+        self.assertTrue(docker.call_args.kwargs["failure_ok"])
+        self.assertEqual(docker.call_args.kwargs["extra"]["PGPASSWORD"], "unused-synthetic-value-invalid")
+        self.assertNotIn("unused-synthetic-value", json.dumps(example.checks+example.failures))
+
+    def test_unrestricted_listening_socket_connection_or_non_scram_are_rejected(self):
+        changes = [(0, "*"), (0, "0.0.0.0"), (0, "::"), (0, "localhost"),
+                   (1, None), (1, "0.0.0.0"), (1, "::1"), (2, 25439), (2, True),
+                   (3, "other"), (4, "other"), (5, "md5"), (6, False), (7, False), (8, False),
+                   (6, None), (7, None), (8, None), (6, 1), (7, 1), (8, 1)]
+        for index, value in changes:
+            with self.subTest(index=index, value=value):
+                result = self.expected()
+                result[index] = value
+                with self.assertRaises(RuntimeError):
+                    self.verify(result)
+
+    def test_wrong_password_must_fail_and_return_no_partial_output(self):
+        for negative in ((0, b""), (0, b"1\n"), (1, b""), (3, b""), (2, b"partial-output")):
+            with self.subTest(exit_code=negative[0]):
+                with self.assertRaises(RuntimeError):
+                    self.verify(negative=negative)
+
+    def test_malformed_postgres_settings_are_rejected(self):
+        for result in ({}, "do-not-emit-this", [], self.expected()[:-1], self.expected()+[True]):
+            with self.subTest(kind=type(result).__name__):
+                with self.assertRaises(RuntimeError):
+                    self.verify(result)
+
+    def test_malformed_authenticated_sql_output_is_rejected_and_not_logged(self):
+        example = Diagnostics().example()
+        sentinel = "do-not-emit-this"
+        with mock.patch.object(example, "query", return_value=(0, sentinel.encode())), \
+             mock.patch.object(example, "docker") as docker:
+            with self.assertRaises(json.JSONDecodeError) as caught:
+                example.verify_postgres({"id": "synthetic"})
+        example.record_failure(caught.exception)
+        self.assertEqual(example.failures[0]["category"], "INVALID_OUTPUT")
+        self.assertNotIn(sentinel, json.dumps(example.failures))
+        docker.assert_not_called()
+
+    def test_failed_authentication_verification_prevents_database_creation(self):
+        case = ZeroPublication()
+        example, obj, item, net = case.configuration()
+        example.image_id = obj["Image"]
+        example.abort = mock.Mock()
+        example.abort.wait.return_value = False
+        limits = (str(recovery.MEMORY)+"\n0\n100000 100000\n128\n").encode()
+        def docker(*args, **options):
+            if args[:2] == ("container", "inspect"):
+                return 1, b""
+            if args[0] == "exec" and "sh" in args:
+                return 0, limits
+            return 0, b""
+        with mock.patch.object(example, "create"), mock.patch.object(example, "journal"), \
+             mock.patch.object(example, "docker", side_effect=docker), \
+             mock.patch.object(example, "inspect", side_effect=lambda kind, identifier: net if kind == "network" else obj), \
+             mock.patch.object(example, "sample"), \
+             mock.patch.object(example, "verify_postgres", side_effect=RuntimeError("SAFETY_CHECK_FAILED")), \
+             mock.patch.object(example, "query") as query:
+            with self.assertRaisesRegex(RuntimeError, "SAFETY_CHECK_FAILED"):
+                example.database("source")
+        query.assert_not_called()
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
