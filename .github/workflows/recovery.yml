@@ -1,0 +1,51 @@
+{
+  "name": "Synthetic PostgreSQL recovery",
+  "on": {
+    "workflow_dispatch": {
+      "inputs": {
+        "approval": {
+          "description": "Enter SYNTHETIC_ONLY for the reviewed synthetic example",
+          "required": true,
+          "type": "string"
+        }
+      }
+    }
+  },
+  "permissions": {},
+  "concurrency": {
+    "group": "synthetic-postgresql-recovery",
+    "cancel-in-progress": false
+  },
+  "jobs": {
+    "recovery": {
+      "if": "${{ github.actor == github.repository_owner && github.event.repository.private == false && github.run_attempt == 1 }}",
+      "runs-on": "ubuntu-24.04",
+      "timeout-minutes": 60,
+      "env": {
+        "APPROVAL": "${{ inputs.approval }}"
+      },
+      "defaults": {
+        "run": {
+          "shell": "bash --noprofile --norc -e -o pipefail {0}"
+        }
+      },
+      "steps": [
+        {
+          "name": "Check capacity before downloads",
+          "timeout-minutes": 2,
+          "run": "python3 -B - --approve-capacity <<'PY'\n\"\"\"Generic, download-free capacity gate for a manually approved public runner.\"\"\"\nimport json\nimport os\nimport pathlib\nimport re\nimport shutil\nimport subprocess\nimport sys\nimport time\n\nGIB = 1024 ** 3\n\n\ndef require(value):\n    if not value:\n        raise RuntimeError(\"SAFETY_CHECK_FAILED\")\n\n\ndef context_ok(env, event):\n    repository = event.get(\"repository\", {})\n    owner = env.get(\"GITHUB_REPOSITORY_OWNER\", \"\")\n    return all((\n        bool(owner), env.get(\"GITHUB_ACTIONS\") == \"true\", env.get(\"RUNNER_ENVIRONMENT\") == \"github-hosted\",\n        env.get(\"RUNNER_OS\") == \"Linux\", env.get(\"RUNNER_ARCH\") == \"X64\",\n        env.get(\"GITHUB_EVENT_NAME\") == \"workflow_dispatch\", env.get(\"GITHUB_ACTOR\") == owner,\n        repository.get(\"private\") is False, repository.get(\"owner\", {}).get(\"login\") == owner,\n        repository.get(\"full_name\") == env.get(\"GITHUB_REPOSITORY\"),\n        re.fullmatch(r\"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\", env.get(\"GITHUB_REPOSITORY\", \"\")) is not None,\n        str(repository.get(\"id\", \"\")) == env.get(\"GITHUB_REPOSITORY_ID\"),\n        env.get(\"GITHUB_RUN_ID\", \"\").isdigit(), env.get(\"GITHUB_RUN_ATTEMPT\") == \"1\",\n        env.get(\"GITHUB_REF\") == \"refs/heads/main\", env.get(\"APPROVAL\") == \"SYNTHETIC_ONLY\",\n        re.fullmatch(r\"[0-9a-f]{40}\", env.get(\"GITHUB_SHA\", \"\")) is not None,\n    ))\n\n\ndef memory():\n    values = {line.split(\":\")[0]: int(line.split()[1]) * 1024\n              for line in pathlib.Path(\"/proc/meminfo\").read_text().splitlines()}\n    available = values[\"MemAvailable\"]\n    group = next((line.split(\":\", 2)[2] for line in pathlib.Path(\"/proc/self/cgroup\").read_text().splitlines()\n                  if line.startswith(\"0::\")), None)\n    require(group is not None)\n    root = pathlib.Path(\"/sys/fs/cgroup\")\n    node = root / group.lstrip(\"/\")\n    if not node.exists():\n        node = root\n    for parent in (node, *node.parents):\n        if parent != root and root not in parent.parents:\n            continue\n        limit, used = parent / \"memory.max\", parent / \"memory.current\"\n        if limit.exists() and used.exists() and limit.read_text().strip() != \"max\":\n            available = min(available, int(limit.read_text()) - int(used.read_text()))\n        if parent == root:\n            break\n    return values[\"MemTotal\"], max(0, available)\n\n\ndef safe_environment():\n    result = {key: os.environ[key] for key in (\"PATH\",) if key in os.environ}\n    # Do not read ambient Docker credentials or forward runner credentials.\n    result.update(HOME=\"/nonexistent\", DOCKER_CONFIG=\"/nonexistent\",\n                  DOCKER_HOST=\"unix:///var/run/docker.sock\", LC_ALL=\"C.UTF-8\", LANG=\"C.UTF-8\")\n    return result\n\n\ndef capacity_reason(data):\n    if min(data[\"cpus\"], data[\"engine_cpus\"]) < 4:\n        return \"CPU_CAPACITY\"\n    if min(data[\"total_memory\"], data[\"engine_memory\"]) < 15 * GIB:\n        return \"TOTAL_MEMORY_CAPACITY\"\n    if data[\"available_memory\"] < 6 * GIB:\n        return \"AVAILABLE_MEMORY\"\n    if not data[\"disks\"] or min(data[\"disks\"].values()) < 18 * GIB:\n        return \"DISK_CAPACITY\"\n    return None\n\n\ndef runtime_reason(available, disks, initial):\n    if available < 4 * GIB:\n        return \"MEMORY_FLOOR\"\n    if set(disks) != set(initial) or min(disks.values()) < 10.5 * GIB:\n        return \"DISK_FLOOR\"\n    if any(initial[path] - disks[path] >= 7.5 * GIB for path in initial):\n        return \"DISK_GROWTH\"\n    return None\n\n\ndef measure():\n    require(sys.platform == \"linux\" and all(shutil.which(tool) for tool in (\"docker\", \"git\", \"go\", \"ss\")))\n    require(hasattr(os, \"memfd_create\"))\n    total, available = memory()\n    def query(*args):\n        p = subprocess.run([\"docker\", *args], env=safe_environment(), capture_output=True, timeout=10)\n        require(p.returncode == 0 and len(p.stdout) < 1024 * 1024)\n        return json.loads(p.stdout)\n    require(query(\"context\", \"inspect\")[0][\"Endpoints\"][\"docker\"][\"Host\"].startswith(\"unix://\"))\n    info = query(\"info\", \"--format\", \"{{json .}}\")\n    require(info[\"DockerRootDir\"] == \"/var/lib/docker\")\n    paths = (\"/\", os.environ[\"RUNNER_TEMP\"], \"/var/lib/docker\", \"/var/lib/containerd\")\n    return {\"cpus\": os.cpu_count() or 0, \"engine_cpus\": info[\"NCPU\"], \"total_memory\": total,\n            \"engine_memory\": info[\"MemTotal\"], \"available_memory\": available,\n            \"disks\": {path: shutil.disk_usage(path).free for path in paths}}\n\n\ndef gate_file():\n    return pathlib.Path(os.environ[\"RUNNER_TEMP\"]) / \"synthetic-recovery-gate.json\"\n\n\ndef main():\n    if sys.argv[1:] != [\"--approve-capacity\"]:\n        print(\"INERT\")\n        return 0\n    stage = \"context\"\n    try:\n        origin = {\"wall\": time.time(), \"mono\": time.monotonic()}\n        event = json.loads(pathlib.Path(os.environ[\"GITHUB_EVENT_PATH\"]).read_text())\n        require(context_ok(os.environ, event))\n        stage = \"resource_measurement\"\n        data = measure()\n        print(json.dumps({\"capacity_measurements\": data}))\n        stage = \"capacity_thresholds\"\n        reason = capacity_reason(data)\n        if reason:\n            print(json.dumps({\"status\": \"BLOCKED_BEFORE_DOWNLOADS\", \"reason\": reason}))\n            return 2\n        record = {\"origin\": origin, \"capacity\": data, \"run\": os.environ[\"GITHUB_RUN_ID\"],\n                  \"repository\": os.environ[\"GITHUB_REPOSITORY_ID\"], \"commit\": os.environ[\"GITHUB_SHA\"]}\n        with gate_file().open(\"x\", encoding=\"utf-8\") as handle:\n            json.dump(record, handle)\n        print('{\"status\":\"CAPACITY_PASSED\"}')\n        return 0\n    except Exception as error:\n        print(json.dumps({\"status\": \"BLOCKED_BEFORE_DOWNLOADS\", \"reason\": \"UNVERIFIED_SAFETY\",\n                          \"stage\": stage, \"error_type\": type(error).__name__}))\n        return 2\n\n\nif __name__ == \"__main__\":\n    sys.exit(main())\n\nPY\n"
+        },
+        {
+          "name": "Read only the reviewed public commit anonymously",
+          "timeout-minutes": 3,
+          "run": "python3 -B - <<'PY'\nimport json, os, pathlib, re, subprocess, sys, time\ntry:\n    temp = pathlib.Path(os.environ[\"RUNNER_TEMP\"])\n    gate = json.loads((temp/\"synthetic-recovery-gate.json\").read_text())\n    repo, commit = os.environ[\"GITHUB_REPOSITORY\"], os.environ[\"GITHUB_SHA\"]\n    assert re.fullmatch(r\"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\", repo)\n    assert re.fullmatch(r\"[0-9a-f]{40}\", commit)\n    assert gate[\"commit\"] == commit and gate[\"run\"] == os.environ[\"GITHUB_RUN_ID\"]\n    assert gate[\"repository\"] == os.environ[\"GITHUB_REPOSITORY_ID\"]\n    assert 0 <= time.monotonic()-gate[\"origin\"][\"mono\"] < 180\n    folder = temp/\"public-recovery-control\"\n    folder.mkdir(mode=0o700, exist_ok=False)\n    empty = folder/\"empty-template\"\n    empty.mkdir(mode=0o700)\n    env = {\"PATH\": os.environ[\"PATH\"], \"HOME\": str(empty), \"LANG\": \"C.UTF-8\",\n           \"GIT_CONFIG_NOSYSTEM\": \"1\", \"GIT_CONFIG_GLOBAL\": \"/dev/null\", \"GIT_TERMINAL_PROMPT\": \"0\",\n           \"GIT_CONFIG_COUNT\": \"4\", \"GIT_CONFIG_KEY_0\": \"credential.helper\", \"GIT_CONFIG_VALUE_0\": \"\",\n           \"GIT_CONFIG_KEY_1\": \"http.extraHeader\", \"GIT_CONFIG_VALUE_1\": \"\",\n           \"GIT_CONFIG_KEY_2\": \"core.hooksPath\", \"GIT_CONFIG_VALUE_2\": \"/dev/null\",\n           \"GIT_CONFIG_KEY_3\": \"http.followRedirects\", \"GIT_CONFIG_VALUE_3\": \"false\"}\n    def git(*args):\n        result = subprocess.run([\"git\", *args], cwd=folder, env=env, capture_output=True, timeout=90)\n        assert result.returncode == 0 and len(result.stdout) < 1048576\n        return result.stdout.decode()\n    git(\"init\", \"--template=\"+str(empty))\n    git(\"fetch\", \"--no-tags\", \"--depth=1\", \"https://github.com/\"+repo+\".git\", commit)\n    allowed = {\".github/workflows/recovery.yml\", \"preflight.py\", \"recovery.py\", \"test_recovery.py\", \"README.md\"}\n    entries = git(\"ls-tree\", \"-r\", commit).splitlines()\n    assert len(entries) == len(allowed)\n    assert {line.split(\"\\t\", 1)[1] for line in entries} == allowed\n    assert all(line.startswith(\"100644 blob \") for line in entries)\n    git(\"checkout\", \"--detach\", commit)\n    assert git(\"rev-parse\", \"HEAD\").strip() == commit\n    print('{\"status\":\"PUBLIC_COMMIT_REVIEW_SET_ONLY\"}')\nexcept Exception:\n    print('{\"status\":\"STOPPED\",\"reason\":\"PUBLIC_FETCH_UNVERIFIED\"}')\n    sys.exit(2)\n\nPY\n"
+        },
+        {
+          "name": "Run isolated synthetic recovery and bounded cleanup",
+          "timeout-minutes": 55,
+          "run": "python3 -B \"$RUNNER_TEMP/public-recovery-control/recovery.py\" --run"
+        }
+      ]
+    }
+  }
+}
