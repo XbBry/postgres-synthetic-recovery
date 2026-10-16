@@ -1,6 +1,7 @@
 """Standalone synthetic PostgreSQL recovery example. Inert without --run."""
 import hashlib
 import io
+import ipaddress
 import json
 import os
 import pathlib
@@ -93,6 +94,88 @@ def configuration_ok(obj, item):
                 mounts[0].get("Destination") == "/var/lib/postgresql/data" if mounts else False))
 
 
+def loopback_binding_reason(obj, item):
+    settings = obj.get("NetworkSettings")
+    if settings is None:
+        return "MISSING_PORT_MAPPING"
+    if type(settings) is not dict:
+        return "UNEXPECTED_MAPPING_STRUCTURE"
+    ports = settings.get("Ports")
+    if ports is None or ports == {}:
+        return "MISSING_PORT_MAPPING"
+    if type(ports) is not dict:
+        return "UNEXPECTED_MAPPING_STRUCTURE"
+    if set(ports) != {"5432/tcp"}:
+        return "ADDITIONAL_MAPPING_ENTRIES"
+    rows = ports["5432/tcp"]
+    if rows is None or rows == []:
+        return "MISSING_PORT_MAPPING"
+    if type(rows) is not list:
+        return "UNEXPECTED_MAPPING_STRUCTURE"
+    if len(rows) != 1:
+        return "ADDITIONAL_MAPPING_ENTRIES"
+    row = rows[0]
+    if type(row) is not dict or set(row) != {"HostIp", "HostPort"}:
+        return "UNEXPECTED_MAPPING_STRUCTURE"
+    if row["HostIp"] != "127.0.0.1":
+        return "UNEXPECTED_HOST_IP"
+    if row["HostPort"] != str(item["port"]):
+        return "HOST_PORT_MISMATCH"
+    return None
+
+
+def binding_diagnostic(obj, item, network=None):
+    # Allowlisted scalars only. Never serialize the full inspect result or errors.
+    def address(value):
+        if value in (None, ""):
+            return value
+        if isinstance(value, str) and len(value) <= 45 and "%" not in value:
+            try:
+                ipaddress.ip_address(value)
+                return value
+            except ValueError:
+                pass
+        return "REDACTED"
+
+    def port(value):
+        if value is None or value == "":
+            return value
+        if type(value) in (str, int) and re.fullmatch(r"[0-9]{1,5}", str(value)) and 0 <= int(value) <= 65535:
+            return value  # Preserve string vs integer representation for diagnosis.
+        return "REDACTED"
+
+    def bindings(value):
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            return "UNEXPECTED_TYPE"
+        result = {"entries": [], "count": len(value)}
+        for key, rows in list(value.items())[:8]:
+            safe_key = key if isinstance(key, str) and re.fullmatch(r"[0-9]{1,5}/(?:tcp|udp|sctp)", key) else "REDACTED"
+            safe_rows = None if rows is None else "UNEXPECTED_TYPE"
+            if isinstance(rows, list):
+                safe_rows = [{"HostIp": address(row.get("HostIp")), "HostPort": port(row.get("HostPort"))}
+                             if isinstance(row, dict) else "UNEXPECTED_TYPE" for row in rows[:8]]
+            result["entries"].append({"container_port": safe_key, "bindings": safe_rows,
+                                      "binding_count": len(rows) if isinstance(rows, list) else None})
+        return result
+
+    host, runtime, state = (obj[key] if isinstance(obj.get(key), dict) else {}
+                            for key in ("HostConfig", "NetworkSettings", "State"))
+    network = network or {}
+    options = network.get("Options") if isinstance(network.get("Options"), dict) else {}
+    boolean = lambda value: value if type(value) is bool else None
+    modes = {"nat", "nat-unprotected", "routed", "isolated"}
+    return {"configured_present": "PortBindings" in host, "configured": bindings(host.get("PortBindings")),
+            "runtime_present": "Ports" in runtime, "runtime": bindings(runtime.get("Ports")),
+            "publish_all_ports": boolean(host.get("PublishAllPorts")), "running": boolean(state.get("Running")),
+            "only_owned_network": isinstance(runtime.get("Networks"), dict) and set(runtime["Networks"]) == {item["network"]},
+            "network_internal": boolean(network.get("Internal")), "network_ipv6": boolean(network.get("EnableIPv6")),
+            "network_driver": "bridge" if network.get("Driver") == "bridge" else "UNRECORDED_OR_OTHER",
+            "gateway_modes": {version: (mode if isinstance(mode, str) and mode in modes else "UNSET_OR_OTHER") for version in ("ipv4", "ipv6")
+                              for mode in (options.get("com.docker.network.bridge.gateway_mode_"+version),)}}
+
+
 def decode_bundle(data):
     preflight.require(len(data) <= MAX_OUTPUT)
     bundle = json.loads(data)
@@ -123,6 +206,7 @@ class Example:
         self.checks = []
         self.stage = "initialization"
         self.failures = []
+        self.binding_diagnostics = []
         self.timings = {}
         self.minimum_ram = float("inf")
         self.minimum_disk = float("inf")
@@ -221,8 +305,11 @@ class Example:
                     preflight.require(set(obj["NetworkSettings"]["Networks"]) == {item["network"]})
                     if obj["State"]["Running"]:
                         guard = "watchdog_loopback_port_binding"
-                        preflight.require(obj["NetworkSettings"]["Ports"] == {
-                            "5432/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(item["port"])}]})
+                        binding_reason = loopback_binding_reason(obj, item)
+                        if binding_reason is not None:
+                            self.binding_diagnostics.append({"stage": self.stage, "origin": "watchdog",
+                                                             "reason": binding_reason, **binding_diagnostic(obj, item)})
+                        preflight.require(binding_reason is None)
                     active += bool(obj["State"]["Running"])
                 guard = "watchdog_single_running_database"
                 preflight.require(active <= 1)
@@ -381,7 +468,10 @@ class Example:
         self.journal()
         self.stage = phase + "_port_binding"
         obj = self.inspect("container", item["id"])
-        self.check("explicit_loopback_only", obj["NetworkSettings"]["Ports"] == {"5432/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(port)}]})
+        binding_reason = loopback_binding_reason(obj, item)
+        self.binding_diagnostics.append({"stage": self.stage, "origin": "main", "reason": binding_reason,
+                                         **binding_diagnostic(obj, item, net)})
+        self.check("explicit_loopback_only", binding_reason is None)
         self.check("only_owned_network", set(obj["NetworkSettings"]["Networks"]) == {network})
         self.stage = phase + "_resource_limits"
         limits = self.docker("exec", item["id"], "sh", "-c", "cat /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.swap.max /sys/fs/cgroup/cpu.max /sys/fs/cgroup/pids.max")[1].decode().splitlines()
@@ -643,6 +733,7 @@ def main():
               "execution_stage": execution_stage, "check_results": example.checks if example else [],
               "failed_checks": [check for check in example.checks if not check["passed"]] if example else [],
               "failures": example.failures if example else initialization_failure,
+              "binding_diagnostics": example.binding_diagnostics if example else [],
               "not_tested": ["application recovery", "hosted authentication", "provider backup services"],
               "timings": example.timings if example else {}}
     if example and example.minimum_ram != float("inf"):
