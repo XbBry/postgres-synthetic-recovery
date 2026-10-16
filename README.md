@@ -3,6 +3,11 @@
 **Synthetic recovery example. Source publication alone is not recovery evidence;
 use the corresponding workflow run for actual execution results.**
 
+**Stage 1 live recovery has NOT passed. The zero-published-ports revision has
+offline test coverage only. Stage 2 Supabase/application recovery, including
+Auth and MFA recovery, remains unverified. Publication and execution each require
+separate approval.**
+
 This independent example contains no application source, application migrations,
 designs, private snapshots, stored credentials, production connections, or real
 customer data. It is not a backup service or evidence of application recovery.
@@ -19,7 +24,9 @@ grants, and forced row-level security. It would:
 2. Verify the public age 1.3.2 binary using its SHA-256 and the publisher's Sigsum
    proof. Reject a damaged binary before trusting it. Verify a digest-pinned
    official PostgreSQL image and its platform and size before use.
-3. Create the source only after inspecting effective isolation and limits.
+3. Create the source only after inspecting effective isolation and limits, with
+   no published host ports. Verify container-local listening and authenticated
+   SCRAM SQL connectivity before creating fixtures.
 4. Capture real `pg_dump` SQL and selected `pg_dumpall` role definitions.
 5. Encrypt an integrity-checked bundle using a newly generated disposable age key.
 6. Reject an incorrect key, damaged/truncated ciphertext, malformed bundles,
@@ -49,15 +56,35 @@ The three-row total checks integer preservation, not a financial reconciliation 
 | Initial disk | At least 18 GiB free on every relevant filesystem |
 | Disk stop margins | Stop at less than 10.5 GiB free or growth of 7.5 GiB; hard objectives remain 10 GiB and 8 GiB |
 | Database | One active container at a time; 768 MiB memory and equal memory+swap limit, one CPU, 128 PIDs, 64 MiB shared memory |
-| Ports | Only `127.0.0.1:25439:5432/tcp` and `127.0.0.1:25440:5432/tcp`, used sequentially |
-| Networks | Separate labeled internal bridges, no host networking; explicit publish binding is also required |
+| Ports | No configured or actual runtime host-port publication; `PublishAllPorts=false` |
+| Networks | Separate owned, labeled internal bridges with IPv6 disabled; exactly the owned attachment, no host or external network |
+| PostgreSQL access | `listen_addresses=127.0.0.1` inside the container; authenticated `docker exec` clients over container-loopback TCP with SCRAM |
 | Storage | Separate labeled source/target volumes; no host directory mounts |
 | Work deadline | 45 minutes from the initial capacity step, including downloads |
 | Cleanup deadline | At most 270 seconds, ending by minute 51 |
 | Independent outer timeout | One job, 60 minutes; no automatic retry, matrix, or scheduled trigger |
 
-The watchdog samples memory, disk, Docker limits, running containers, published
-bindings and OOM status every second. It terminates the current owned command and
+The main controller and watchdog enforce the same strict zero-publication and
+owned-network checks. Required inspection data must be present and well-formed.
+`HostConfig.PortBindings` must be explicitly `{}` or `null`, with
+`PublishAllPorts=false`. `NetworkSettings.Ports` must be `{}` or
+`{"5432/tcp":null}`, backed by the pinned image's
+`Config.ExposedPorts={"5432/tcp":{}}`. Image `EXPOSE` metadata does not publish a
+host port. Every configured mapping or
+actual runtime binding, including localhost and wildcard bindings, is rejected.
+
+All database operations, including backup and restore, already use `docker exec`.
+Before fixtures, SQL verifies the effective listening configuration, authenticated
+container-loopback connection, SCRAM host rules and rejection of an incorrect
+password. An internal bridge alone does not prevent Docker-host access to a
+container IP; PostgreSQL's container-local listening limits that SQL access path.
+Docker-daemon access remains privileged. The database container receives no
+external network attachment or outbound internet access.
+
+The watchdog checks memory, disk, Docker limits, running containers, zero
+publication, network isolation/ownership and OOM status at one-second polling
+intervals, subject to Docker-query latency. It terminates the current owned
+command and
 requests owned database stops if a check fails. Sampling cannot guarantee that a
 brief resource excursion is impossible; the stop margins reduce this risk.
 No existing packages, images, caches or Docker resources are deleted to gain space.
@@ -81,8 +108,10 @@ GitHub states standard public runners are free. The example selects only that
 runner class, requires a public manual event by the repository owner, grants no
 token permissions, and fetches its exact public commit anonymously. It uses no
 paid API, larger runner, artifact upload, package publication, prebuild or Codespace.
-Actual capacity, image availability, anonymous registry rate limits and dependency
-verification remain untested. A capacity failure would be a blocked test, not success.
+Every approved run must check actual capacity, image availability, anonymous
+registry access and dependency verification. Prior failed attempts do not verify
+the new zero-publication contract or successful recovery. A capacity failure is a
+blocked test, not success.
 
 ## Execution and cleanup boundaries
 
@@ -101,8 +130,9 @@ in owned container metadata, and plaintext fixture data exists in owned volumes
 and process memory. Memory may be paged by the host; Python cannot promise secure
 erasure. These limitations are acceptable only for disposable synthetic data.
 
-Only sanitized check results, timings and aggregate resource measurements are
-printed. No raw command output, SQL, backups, identities or credentials are uploaded.
+Only sanitized check results, allowlisted binding/network diagnostics, timings
+and aggregate resource measurements are printed. No raw command output, SQL,
+backups, identities or credentials are uploaded.
 Deletion is scoped by fresh IDs, ownership labels and the current run's randomly
 named temporary directory. Global prune, forced volume removal and broad host
 cleanup are absent. Data deletion is not a guarantee of physical secure erasure.
@@ -123,11 +153,14 @@ The publication set is exactly:
 - `test_recovery.py`
 - `README.md`
 
-Review notes, local credential helpers and publication manifests belong outside
-this set. Local static parsing is not an executed recovery
-test. All seven offline guard tests passed locally; they exercise only pure
-validation functions and do not generate keys, start Docker, access networks or
-create databases. Do not publish or execute the draft without separate approval.
+The pending publication diff changes only `README.md`, `recovery.py` and
+`test_recovery.py`; `preflight.py` and the workflow remain unchanged. Review notes,
+local credential helpers and publication manifests belong outside this set.
+Local static parsing and mocked tests are not executed recovery evidence.
+All 31 offline tests passed locally; they cover validation and controller paths
+with external operations mocked. They do not start Docker, access networks,
+generate encryption keys or create databases. Do not publish or execute the
+revision without the corresponding separate approval.
 
 Even a successful future run cannot verify any application's migrations, stored
 procedures, authorization, subscription restrictions, financial invariants,
