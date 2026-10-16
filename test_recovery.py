@@ -1,7 +1,13 @@
 """Offline guard tests. No Docker, downloads, keys, SQL, or cloud operations."""
 import copy
+import contextlib
+import io
 import json
+import sys
+import time
+import types
 import unittest
+from unittest import mock
 
 import preflight
 import recovery
@@ -98,6 +104,132 @@ class Guards(unittest.TestCase):
         bundle["extra"] = True
         with self.assertRaises(RuntimeError):
             recovery.decode_bundle(json.dumps(bundle).encode())
+
+
+class Diagnostics(unittest.TestCase):
+    def example(self):
+        # Constructor only: no files, credentials, Docker, keys or databases.
+        with mock.patch.dict(recovery.os.environ, {"RUNNER_TEMP": "/unused-synthetic-path"}):
+            example = recovery.Example({"origin": {"mono": time.monotonic()}})
+        example.stage = "source_port_binding"
+        return example
+
+    def report(self, *, failure=None, cleanup=True):
+        example = self.example()
+        def execute():
+            if failure == "guard":
+                example.check("explicit_loopback_only", False)
+            if failure == "unexpected":
+                raise RuntimeError("do-not-emit-this")
+        def clean():
+            example.stage = "cleanup"
+            return cleanup
+        output = io.StringIO()
+        fake_resource = types.SimpleNamespace(RLIMIT_CORE=4, setrlimit=lambda *args: None)
+        with mock.patch.dict(sys.modules, {"resource": fake_resource}), \
+             mock.patch.dict(recovery.os.environ, {"GITHUB_EVENT_PATH": "unused"}), \
+             mock.patch.object(recovery.sys, "argv", ["recovery.py", "--run"]), \
+             mock.patch.object(recovery.pathlib.Path, "read_text", return_value="{}"), \
+             mock.patch.object(recovery.preflight, "context_ok", return_value=True), \
+             mock.patch.object(recovery.preflight, "gate_file", return_value=recovery.pathlib.Path("unused-gate")), \
+             mock.patch.object(recovery.signal, "signal"), \
+             mock.patch.object(recovery, "Example", return_value=example), \
+             mock.patch.object(example, "execute", side_effect=execute), \
+             mock.patch.object(example, "cleanup", side_effect=clean), contextlib.redirect_stdout(output):
+            code = recovery.main()
+        return code, json.loads(output.getvalue()), output.getvalue()
+
+    def test_failed_names_and_execution_stage_survive_cleanup(self):
+        code, result, _ = self.report(failure="guard")
+        self.assertEqual(code, 2)
+        self.assertEqual(result["status"], "INCOMPLETE_NOT_ACCEPTED")
+        self.assertTrue(result["cleanup_verified"])
+        failed = [entry for entry in result["check_results"] if not entry["passed"]]
+        self.assertEqual(result["failed_checks"], failed)
+        self.assertEqual([entry["check"] for entry in failed], ["explicit_loopback_only", "execution_completed"])
+        self.assertTrue(all(entry["stage"] == "source_port_binding" for entry in failed))
+        self.assertEqual(result["execution_stage"], "source_port_binding")
+        self.assertEqual(result["failures"][0]["category"], "CHECK_REJECTED")
+
+    def test_cleanup_failure_still_rejects_success(self):
+        code, result, _ = self.report(cleanup=False)
+        self.assertEqual(code, 2)
+        self.assertEqual(result["status"], "INCOMPLETE_NOT_ACCEPTED")
+        self.assertEqual([c["check"] for c in result["check_results"] if not c["passed"]], ["cleanup_completed"])
+        code, result, _ = self.report()
+        self.assertEqual(code, 0)
+        self.assertEqual(result["status"], "VERIFIED")
+
+    def test_unexpected_exception_text_is_never_reported(self):
+        code, result, raw = self.report(failure="unexpected")
+        self.assertEqual(code, 2)
+        self.assertEqual(result["failures"][0]["category"], "UNEXPECTED_ERROR")
+        self.assertNotIn("do-not-emit-this", raw)
+
+    def test_nonzero_commands_discard_partial_output_and_report_exit_code(self):
+        example = self.example()
+        process = mock.Mock(returncode=23)
+        process.communicate.return_value = (b"do-not-emit-this", b"do-not-emit-this")
+        with mock.patch.object(recovery.subprocess, "Popen", return_value=process):
+            self.assertEqual(example.command(["docker", "exec", "do-not-emit-this"], failure_ok=True), (23, b""))
+            self.assertEqual(example.failures, [])
+            with self.assertRaisesRegex(RuntimeError, "COMMAND_FAILED"):
+                example.command(["docker", "exec", "do-not-emit-this"])
+        self.assertEqual(example.failures[0]["exit_code"], 23)
+        self.assertEqual(example.failures[0]["category"], "COMMAND_FAILED")
+        self.assertNotIn("do-not-emit-this", json.dumps(example.failures))
+
+    def test_timeouts_have_safe_category_and_keep_bounded_kill(self):
+        example = self.example()
+        process = mock.Mock(pid=123)
+        process.poll.return_value = None
+        process.communicate.side_effect = [recovery.subprocess.TimeoutExpired("do-not-emit-this", 1), (b"partial", b"do-not-emit-this")]
+        with mock.patch.object(recovery.subprocess, "Popen", return_value=process), \
+             mock.patch.object(recovery.os, "killpg", create=True) as kill, \
+             mock.patch.object(recovery.signal, "SIGKILL", 9, create=True):
+            with self.assertRaisesRegex(RuntimeError, "COMMAND_INCOMPLETE"):
+                example.command(["synthetic-command"])
+            kill.assert_called_once_with(123, 9)
+        self.assertEqual(example.failures[0]["category"], "COMMAND_TIMEOUT")
+        self.assertEqual(process.communicate.call_args.kwargs, {"timeout": 5})
+        self.assertNotIn("do-not-emit-this", json.dumps(example.failures))
+
+    def test_watchdog_names_its_failed_port_guard_and_stops_work(self):
+        example = self.example()
+        obj, item = Guards().configuration()
+        item.update(kind="container", id="synthetic", started=True)
+        obj.update(State={"Running": True, "OOMKilled": False},
+                   NetworkSettings={"Networks": {item["network"]: {}}, "Ports": {}})
+        example.owned = [item]
+        example.done = mock.Mock()
+        example.done.wait.return_value = False
+        with mock.patch.object(example, "sample"), mock.patch.object(example, "inspect", return_value=obj), \
+             mock.patch.object(example, "stop_owned") as stop:
+            example.watch()
+        self.assertTrue(example.abort.is_set())
+        stop.assert_called_once_with()
+        self.assertEqual(example.failures[0], {"stage": "source_port_binding", "origin": "watchdog",
+                         "category": "SAFETY_CHECK_FAILED", "check": "watchdog_loopback_port_binding"})
+
+    def test_safe_error_categories_never_echo_values(self):
+        sentinel = "do-not-emit-this"
+        cases = [(RuntimeError(sentinel), "UNEXPECTED_ERROR"),
+                 (PermissionError(sentinel), "PERMISSION_DENIED"),
+                 (FileNotFoundError(sentinel), "LOCAL_RESOURCE_MISSING"),
+                 (ValueError(sentinel), "INVALID_OUTPUT"),
+                 (recovery.urllib.error.URLError(sentinel), "DOWNLOAD_CONNECTION_ERROR"),
+                 (recovery.urllib.error.HTTPError("https://example.invalid/"+sentinel, 403, sentinel, {}, io.BytesIO()), "DOWNLOAD_HTTP_ERROR")]
+        for error, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(recovery.error_category(error), expected)
+                self.assertNotIn(sentinel, recovery.error_category(error))
+            if isinstance(error, recovery.urllib.error.HTTPError):
+                example = self.example()
+                with mock.patch.object(error, "close", side_effect=RuntimeError(sentinel)):
+                    example.record_failure(error)
+                example.record_failure(error)
+                self.assertTrue(error.fp.closed)
+                self.assertNotIn(sentinel, json.dumps(example.failures))
 
 
 if __name__ == "__main__":
