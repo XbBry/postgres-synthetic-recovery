@@ -14,6 +14,7 @@ import sys
 import tarfile
 import threading
 import time
+import urllib.error
 import urllib.request
 import uuid
 
@@ -60,6 +61,22 @@ def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def error_category(error):
+    # Fixed categories only: exception messages can contain credentials or URLs.
+    for kind, category in ((subprocess.TimeoutExpired, "COMMAND_TIMEOUT"), (TimeoutError, "TIMEOUT"),
+                           (urllib.error.HTTPError, "DOWNLOAD_HTTP_ERROR"),
+                           (urllib.error.URLError, "DOWNLOAD_CONNECTION_ERROR"),
+                           (PermissionError, "PERMISSION_DENIED"), (FileNotFoundError, "LOCAL_RESOURCE_MISSING"),
+                           (OSError, "OPERATING_SYSTEM_ERROR"),
+                           (ValueError, "INVALID_OUTPUT"), (KeyError, "INVALID_OUTPUT"),
+                           (TypeError, "INVALID_OUTPUT"), (IndexError, "INVALID_OUTPUT")):
+        if isinstance(error, kind):
+            return category
+    known = {"SAFETY_CHECK_FAILED", "CHECK_REJECTED", "COMMAND_INCOMPLETE", "COMMAND_FAILED",
+             "DATABASE_NOT_READY", "INTERRUPTED"}
+    return error.args[0] if len(error.args) == 1 and isinstance(error.args[0], str) and error.args[0] in known else "UNEXPECTED_ERROR"
+
+
 def configuration_ok(obj, item):
     host = obj["HostConfig"]
     mounts = obj.get("Mounts", [])
@@ -104,6 +121,8 @@ class Example:
         self.current = None
         self.stop_lock = threading.Lock()
         self.checks = []
+        self.stage = "initialization"
+        self.failures = []
         self.timings = {}
         self.minimum_ram = float("inf")
         self.minimum_disk = float("inf")
@@ -112,8 +131,24 @@ class Example:
         self.baseline = None
 
     def check(self, name, valid):
-        self.checks.append({"check": name, "passed": bool(valid)})
+        self.checks.append({"check": name, "passed": bool(valid), "stage": self.stage})
+        if not valid:
+            self.record_failure(RuntimeError("CHECK_REJECTED"), check=name)
         preflight.require(valid)
+
+    def record_failure(self, error, *, origin=None, check=None, exit_code=None):
+        record = {"stage": self.stage, "category": error_category(error),
+                  "origin": origin or ("main" if threading.current_thread() is threading.main_thread() else "watchdog")}
+        if check is not None:
+            record["check"] = check
+        if isinstance(exit_code, int):
+            record["exit_code"] = exit_code
+        self.failures.append(record)
+        if isinstance(error, urllib.error.HTTPError):
+            try:
+                error.close()  # Avoid destructor warnings that can echo error text.
+            except Exception:
+                pass  # Diagnostics must not replace the original failure.
 
     def command(self, args, data=None, *, timeout=60, failure_ok=False, extra=None, fds=(), cleanup=False):
         if not cleanup:
@@ -128,7 +163,8 @@ class Example:
             self.current = process
         try:
             out, _ = process.communicate(data, timeout=timeout)
-        except BaseException:
+        except BaseException as error:
+            self.record_failure(error, check="command_completion")
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGKILL)
             process.communicate(timeout=5)
@@ -142,6 +178,7 @@ class Example:
         if process.returncode:
             if failure_ok:
                 return process.returncode, b""  # Discard ALL partial output.
+            self.record_failure(RuntimeError("COMMAND_FAILED"), check="command_exit", exit_code=process.returncode)
             raise RuntimeError("COMMAND_FAILED")
         return 0, out
 
@@ -165,23 +202,32 @@ class Example:
 
     def watch(self):
         while not self.done.wait(1):
+            guard = "watchdog_resources"
             try:
                 self.sample()
+                guard = "watchdog_work_deadline"
                 preflight.require(time.monotonic() < self.work_deadline)
                 active = 0
                 for item in list(self.owned):
                     if item["kind"] != "container" or not item.get("started"):
                         continue
+                    guard = "watchdog_container_inspection"
                     obj = self.inspect("container", item["id"])
+                    guard = "watchdog_container_limits_and_oom"
                     preflight.require(configuration_ok(obj, item) and not obj["State"]["OOMKilled"])
+                    guard = "watchdog_container_running"
                     preflight.require(obj["State"]["Running"] or item.get("stopping"))
+                    guard = "watchdog_owned_network_only"
                     preflight.require(set(obj["NetworkSettings"]["Networks"]) == {item["network"]})
                     if obj["State"]["Running"]:
+                        guard = "watchdog_loopback_port_binding"
                         preflight.require(obj["NetworkSettings"]["Ports"] == {
                             "5432/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(item["port"])}]})
                     active += bool(obj["State"]["Running"])
+                guard = "watchdog_single_running_database"
                 preflight.require(active <= 1)
-            except Exception:
+            except Exception as error:
+                self.record_failure(error, origin="watchdog", check=guard)
                 self.abort.set()
                 process = self.current
                 if process is not None and process.poll() is None:
@@ -297,6 +343,7 @@ class Example:
         return item
 
     def database(self, phase, port):
+        self.stage = phase + "_network"
         label = "synthetic.recovery="+self.tag
         prefix = "pg-example-"+self.tag[:12]+"-"+phase
         network, volume = prefix+"-net", prefix+"-data"
@@ -307,6 +354,7 @@ class Example:
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", port))
         password = secrets.token_urlsafe(32)
+        self.stage = phase + "_container_create"
         args = ["create", "--name", prefix, "--label", label, "--pull", "never", "--memory", str(MEMORY),
                 "--memory-swap", str(MEMORY), "--cpus", "1", "--pids-limit", "128", "--shm-size", "64m",
                 "--ipc", "private", "--security-opt", "no-new-privileges:true", "--restart", "no", "--log-driver", "none",
@@ -327,15 +375,19 @@ class Example:
         self.journal()
         self.check("prestart_limits", configuration_ok(obj, item) and obj["Image"] == self.image_id
                    and obj["Config"]["Labels"].get("synthetic.recovery") == self.tag)
+        self.stage = phase + "_container_start"
         self.docker("start", item["id"])
         item["started"] = True
         self.journal()
+        self.stage = phase + "_port_binding"
         obj = self.inspect("container", item["id"])
         self.check("explicit_loopback_only", obj["NetworkSettings"]["Ports"] == {"5432/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(port)}]})
         self.check("only_owned_network", set(obj["NetworkSettings"]["Networks"]) == {network})
+        self.stage = phase + "_resource_limits"
         limits = self.docker("exec", item["id"], "sh", "-c", "cat /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.swap.max /sys/fs/cgroup/cpu.max /sys/fs/cgroup/pids.max")[1].decode().splitlines()
         self.check("effective_resource_limits", len(limits) == 4 and limits[0] == str(MEMORY) and limits[1] == "0"
                    and limits[2].split()[0] == limits[2].split()[1] and limits[3] == "128")
+        self.stage = phase + "_readiness"
         until = time.monotonic()+120
         while time.monotonic() < until:
             if self.docker("exec", item["id"], "pg_isready", "-h", "127.0.0.1", "-U", "postgres", failure_ok=True)[0] == 0:
@@ -343,6 +395,7 @@ class Example:
             time.sleep(1)
         else:
             raise RuntimeError("DATABASE_NOT_READY")
+        self.stage = phase + "_stabilization"
         for _ in range(30):
             preflight.require(not self.abort.wait(1))
         self.sample()
@@ -351,6 +404,7 @@ class Example:
                    for line in listeners if len(line.split()) >= 4 and line.split()[3].endswith(":"+str(port))))
         with socket.create_connection(("127.0.0.1", port), timeout=5):
             pass
+        self.stage = phase + "_database_create"
         self.query(item, "postgres", "CREATE DATABASE specimen;")
         return item
 
@@ -424,17 +478,23 @@ class Example:
             self.stop_lock.release()
 
     def execute(self):
+        self.stage = "preflight"
         self.prepare()
+        self.stage = "command_output_safety"
         code, out = self.command([sys.executable, "-B", "-c",
                                   "import sys;sys.stdout.write('partial');sys.exit(1)"], failure_ok=True)
         self.check("failed_producer_discards_output", code != 0 and out == b"")
+        self.stage = "tool_verification"
         self.tools()
+        self.stage = "image_verification"
         self.image()
         source = self.database("source", 25439)
+        self.stage = "fixture_setup"
         self.query(source, "specimen", FIXTURE, transaction=True)
         self.check("postgres_major", 170000 <= int(self.query(source, "specimen", "SHOW server_version_num;")[1]) < 180000)
         self.behavior(source)
         catalog = self.catalog(source)
+        self.stage = "backup_capture"
         before = time.monotonic()
         connection = {"PGPASSWORD": self.passwords[source["id"]]}
         common = ["exec", "--env", "PGPASSWORD", source["id"]]
@@ -448,6 +508,7 @@ class Example:
                   "sha256": sha(roles.encode()+dump)}
         plaintext = json.dumps(bundle, ensure_ascii=False).encode()
         decode_bundle(plaintext)
+        self.stage = "backup_encryption"
         identity = self.command([self.keygen])[1]
         recipient = self.command([self.keygen, "-y"], identity)[1].decode().strip()
         ciphertext = self.command([self.age, "--encrypt", "--recipient", recipient], plaintext)[1]
@@ -455,6 +516,7 @@ class Example:
         encrypted.write_bytes(ciphertext)
         self.check("encrypted_file_integrity", sha(encrypted.read_bytes()) == sha(ciphertext))
         self.timings["backup_and_encryption_seconds"] = round(time.monotonic()-before, 3)
+        self.stage = "decryption_and_integrity"
         wrong = self.command([self.keygen])[1]
         code, out = self.decrypt(ciphertext, wrong, failure_ok=True)
         self.check("wrong_key_rejected_no_output", code != 0 and not out)
@@ -466,9 +528,11 @@ class Example:
         decoded = self.decrypt(ciphertext, identity)[1]
         self.check("decrypted_hash_exact", sha(decoded) == sha(plaintext))
         recovered = decode_bundle(decoded)
+        self.stage = "source_shutdown"
         self.stop_one(source)
         self.check("source_stopped_before_target", not self.inspect("container", source["id"])["State"]["Running"])
         target = self.database("target", 25440)
+        self.stage = "restore_failure_rejection"
         restore = recovered["roles"]+recovered["sql"]
         before = time.monotonic()
         self.check("empty_target", self.query(target, "specimen", "SELECT count(*) FROM pg_namespace WHERE nspname='sample';")[1].strip() == b"0")
@@ -476,6 +540,7 @@ class Example:
         self.check("full_restore_failure_rejected", code != 0)
         self.check("no_partial_schema", self.query(target, "specimen", "SELECT count(*) FROM pg_namespace WHERE nspname='sample';")[1].strip() == b"0")
         self.check("no_partial_roles", self.query(target, "specimen", "SELECT count(*) FROM pg_roles WHERE rolname IN ('sample_owner','sample_a','sample_b');")[1].strip() == b"0")
+        self.stage = "restore_and_integrity"
         self.query(target, "specimen", restore, transaction=True)
         self.check("restored_catalog_exact", self.catalog(target) == recovered["catalog"])
         self.behavior(target)
@@ -486,6 +551,7 @@ class Example:
         self.timings["restore_and_checks_seconds"] = round(time.monotonic()-before, 3)
 
     def cleanup(self):
+        self.stage = "cleanup"
         before = time.monotonic()
         self.active_cleanup_limit = min(before+270, self.cleanup_limit)
         self.done.set()
@@ -538,6 +604,8 @@ def main():
         return 0
     example = None
     completed = cleaned = False
+    execution_stage = "initialization"
+    initialization_failure = []
     try:
         require_event = json.loads(pathlib.Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
         preflight.require(preflight.context_ok(os.environ, require_event))
@@ -550,22 +618,31 @@ def main():
         signal.signal(signal.SIGINT, interrupted)
         example.execute()
         completed = True
-    except BaseException:
+    except BaseException as error:
         completed = False
+        if example is not None:
+            example.record_failure(error, origin="main")
+        else:
+            initialization_failure.append({"stage": "initialization", "origin": "main", "category": error_category(error)})
     finally:
         if example is not None:
+            execution_stage = example.stage
             try:
                 cleaned = example.cleanup()
-            except BaseException:
+            except BaseException as error:
+                example.record_failure(error, origin="cleanup")
                 cleaned = False
     accepted = bool(completed and cleaned and example is not None and not example.abort.is_set())
     if example is not None:
-        example.checks.extend([{"check": "execution_completed", "passed": completed},
-                               {"check": "cleanup_completed", "passed": cleaned},
-                               {"check": "no_watchdog_failure", "passed": not example.abort.is_set()}])
+        example.checks.extend([{"check": "execution_completed", "passed": completed, "stage": execution_stage},
+                               {"check": "cleanup_completed", "passed": cleaned, "stage": "cleanup"},
+                               {"check": "no_watchdog_failure", "passed": not example.abort.is_set(), "stage": "watchdog"}])
     result = {"status": "VERIFIED" if accepted else "INCOMPLETE_NOT_ACCEPTED", "cleanup_verified": cleaned,
               "checks_passed": sum(c["passed"] for c in example.checks) if example else 0,
               "checks_failed": sum(not c["passed"] for c in example.checks) if example else 0,
+              "execution_stage": execution_stage, "check_results": example.checks if example else [],
+              "failed_checks": [check for check in example.checks if not check["passed"]] if example else [],
+              "failures": example.failures if example else initialization_failure,
               "not_tested": ["application recovery", "hosted authentication", "provider backup services"],
               "timings": example.timings if example else {}}
     if example and example.minimum_ram != float("inf"):
