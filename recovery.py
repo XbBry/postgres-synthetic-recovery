@@ -9,7 +9,6 @@ import re
 import secrets
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import tarfile
@@ -88,44 +87,61 @@ def configuration_ok(obj, item):
                 not host.get("CapAdd"), not host.get("Devices"), host["NetworkMode"] == item["network"],
                 host["RestartPolicy"]["Name"] == "no", host["LogConfig"]["Type"] == "none",
                 "no-new-privileges:true" in host.get("SecurityOpt", []),
-                host["PortBindings"] == {"5432/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(item["port"])}]},
+                zero_publication_reason(obj) is None,
                 len(mounts) == 1, mounts[0].get("Name") == item["volume"] if mounts else False,
                 mounts[0].get("Type") == "volume" if mounts else False,
                 mounts[0].get("Destination") == "/var/lib/postgresql/data" if mounts else False))
 
 
-def loopback_binding_reason(obj, item):
-    settings = obj.get("NetworkSettings")
-    if settings is None:
-        return "MISSING_PORT_MAPPING"
-    if type(settings) is not dict:
-        return "UNEXPECTED_MAPPING_STRUCTURE"
-    ports = settings.get("Ports")
-    if ports is None or ports == {}:
-        return "MISSING_PORT_MAPPING"
+def zero_publication_reason(obj):
+    if type(obj) is not dict or any(type(obj.get(key)) is not dict for key in ("HostConfig", "NetworkSettings", "Config")):
+        return "MISSING_OR_INVALID_INSPECTION"
+    host, runtime, config = obj["HostConfig"], obj["NetworkSettings"], obj["Config"]
+    if not {"PortBindings", "PublishAllPorts"} <= host.keys() or "Ports" not in runtime or "ExposedPorts" not in config:
+        return "MISSING_OR_INVALID_INSPECTION"
+    if host["PublishAllPorts"] is not False:
+        return "PUBLISH_ALL_PORTS"
+    bindings = host["PortBindings"]
+    if bindings is not None and type(bindings) is not dict:
+        return "MISSING_OR_INVALID_INSPECTION"
+    if bindings:
+        return "CONFIGURED_PORT_PUBLICATION"
+    # The pinned PostgreSQL image exposes this metadata; it publishes nothing.
+    exposed = config["ExposedPorts"]
+    if type(exposed) is not dict or exposed != {"5432/tcp": {}}:
+        return "UNEXPECTED_EXPOSE_METADATA"
+    ports = runtime["Ports"]
     if type(ports) is not dict:
-        return "UNEXPECTED_MAPPING_STRUCTURE"
-    if set(ports) != {"5432/tcp"}:
-        return "ADDITIONAL_MAPPING_ENTRIES"
-    rows = ports["5432/tcp"]
-    if rows is None or rows == []:
-        return "MISSING_PORT_MAPPING"
-    if type(rows) is not list:
-        return "UNEXPECTED_MAPPING_STRUCTURE"
-    if len(rows) != 1:
-        return "ADDITIONAL_MAPPING_ENTRIES"
-    row = rows[0]
-    if type(row) is not dict or set(row) != {"HostIp", "HostPort"}:
-        return "UNEXPECTED_MAPPING_STRUCTURE"
-    if row["HostIp"] != "127.0.0.1":
-        return "UNEXPECTED_HOST_IP"
-    if row["HostPort"] != str(item["port"]):
-        return "HOST_PORT_MISMATCH"
+        return "MISSING_OR_INVALID_INSPECTION"
+    if not ports.keys() <= exposed.keys():
+        return "UNEXPECTED_RUNTIME_PORTS"
+    if any(value is not None for value in ports.values()):
+        return "RUNTIME_PORT_PUBLICATION"
     return None
+
+
+def internal_network_ok(network, name, tag):
+    return (type(network) is dict and network.get("Name") == name
+            and type(network.get("Id")) is str and bool(network["Id"])
+            and network.get("Driver") == "bridge" and network.get("Internal") is True
+            and network.get("EnableIPv6") is False and type(network.get("Labels")) is dict
+            and network["Labels"].get("synthetic.recovery") == tag)
+
+
+def isolated_network_ok(obj, item, network, tag):
+    if not internal_network_ok(network, item["network"], tag) or network["Id"] != item["network_id"]:
+        return False
+    if type(obj) is not dict or any(type(obj.get(key)) is not dict for key in ("HostConfig", "NetworkSettings")):
+        return False
+    attached = obj["NetworkSettings"].get("Networks")
+    return (obj["HostConfig"].get("NetworkMode") == item["network"] and type(attached) is dict
+            and set(attached) == {item["network"]} and type(attached[item["network"]]) is dict
+            and attached[item["network"]].get("NetworkID") == item["network_id"])
 
 
 def binding_diagnostic(obj, item, network=None):
     # Allowlisted scalars only. Never serialize the full inspect result or errors.
+    obj = obj if type(obj) is dict else {}
     def address(value):
         if value in (None, ""):
             return value
@@ -162,7 +178,7 @@ def binding_diagnostic(obj, item, network=None):
 
     host, runtime, state = (obj[key] if isinstance(obj.get(key), dict) else {}
                             for key in ("HostConfig", "NetworkSettings", "State"))
-    network = network or {}
+    network = network if type(network) is dict else {}
     options = network.get("Options") if isinstance(network.get("Options"), dict) else {}
     boolean = lambda value: value if type(value) is bool else None
     modes = {"nat", "nat-unprotected", "routed", "isolated"}
@@ -297,19 +313,19 @@ class Example:
                         continue
                     guard = "watchdog_container_inspection"
                     obj = self.inspect("container", item["id"])
+                    guard = "watchdog_zero_publication"
+                    binding_reason = zero_publication_reason(obj)
+                    if binding_reason is not None:
+                        self.binding_diagnostics.append({"stage": self.stage, "origin": "watchdog",
+                                                         "reason": binding_reason, **binding_diagnostic(obj, item)})
+                    preflight.require(binding_reason is None)
                     guard = "watchdog_container_limits_and_oom"
                     preflight.require(configuration_ok(obj, item) and not obj["State"]["OOMKilled"])
                     guard = "watchdog_container_running"
                     preflight.require(obj["State"]["Running"] or item.get("stopping"))
-                    guard = "watchdog_owned_network_only"
-                    preflight.require(set(obj["NetworkSettings"]["Networks"]) == {item["network"]})
-                    if obj["State"]["Running"]:
-                        guard = "watchdog_loopback_port_binding"
-                        binding_reason = loopback_binding_reason(obj, item)
-                        if binding_reason is not None:
-                            self.binding_diagnostics.append({"stage": self.stage, "origin": "watchdog",
-                                                             "reason": binding_reason, **binding_diagnostic(obj, item)})
-                        preflight.require(binding_reason is None)
+                    guard = "watchdog_owned_internal_network"
+                    network = self.inspect("network", item["network_id"])
+                    preflight.require(isolated_network_ok(obj, item, network, self.tag))
                     active += bool(obj["State"]["Running"])
                 guard = "watchdog_single_running_database"
                 preflight.require(active <= 1)
@@ -429,30 +445,31 @@ class Example:
         self.journal()
         return item
 
-    def database(self, phase, port):
+    def database(self, phase):
         self.stage = phase + "_network"
         label = "synthetic.recovery="+self.tag
         prefix = "pg-example-"+self.tag[:12]+"-"+phase
         network, volume = prefix+"-net", prefix+"-data"
         self.create("network", network, ["network", "create", "--internal", "--driver", "bridge", "--label", label, network])
         net = self.inspect("network", network)
-        self.check("internal_network", net["Internal"] and not net["EnableIPv6"])
+        self.check("internal_network", internal_network_ok(net, network, self.tag))
         self.create("volume", volume, ["volume", "create", "--label", label, volume])
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", port))
         password = secrets.token_urlsafe(32)
         self.stage = phase + "_container_create"
         args = ["create", "--name", prefix, "--label", label, "--pull", "never", "--memory", str(MEMORY),
                 "--memory-swap", str(MEMORY), "--cpus", "1", "--pids-limit", "128", "--shm-size", "64m",
                 "--ipc", "private", "--security-opt", "no-new-privileges:true", "--restart", "no", "--log-driver", "none",
-                "--network", network, "--publish", f"127.0.0.1:{port}:5432/tcp",
+                "--network", network,
                 "--mount", f"type=volume,src={volume},dst=/var/lib/postgresql/data", "--env", "POSTGRES_PASSWORD",
-                "--env", "POSTGRES_HOST_AUTH_METHOD=scram-sha-256", IMAGE,
-                "postgres", "-c", "shared_buffers=64MB", "-c", "work_mem=2MB", "-c", "maintenance_work_mem=32MB",
+                "--env", "POSTGRES_HOST_AUTH_METHOD=scram-sha-256",
+                "--env", "POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256", IMAGE,
+                "postgres", "-c", "listen_addresses=127.0.0.1", "-c", "password_encryption=scram-sha-256",
+                "-c", "shared_buffers=64MB", "-c", "work_mem=2MB", "-c", "maintenance_work_mem=32MB",
                 "-c", "max_connections=32", "-c", "max_parallel_workers=0", "-c", "log_statement=none",
                 "-c", "log_min_error_statement=panic", "-c", "log_connections=off", "-c", "log_disconnections=off"]
         self.check("fresh_container", self.docker("container", "inspect", prefix, failure_ok=True)[0] != 0)
-        item = {"kind": "container", "id": prefix, "name": prefix, "network": network, "volume": volume, "port": port, "started": False}
+        item = {"kind": "container", "id": prefix, "name": prefix, "network": network,
+                "network_id": net["Id"], "volume": volume, "started": False}
         self.owned.append(item)
         self.journal()
         self.docker(*args, extra={"POSTGRES_PASSWORD": password})
@@ -460,19 +477,21 @@ class Example:
         item["id"] = obj["Id"]
         self.passwords[item["id"]] = password
         self.journal()
+        self.check("zero_published_ports_prestart", zero_publication_reason(obj) is None)
         self.check("prestart_limits", configuration_ok(obj, item) and obj["Image"] == self.image_id
                    and obj["Config"]["Labels"].get("synthetic.recovery") == self.tag)
         self.stage = phase + "_container_start"
         self.docker("start", item["id"])
         item["started"] = True
         self.journal()
-        self.stage = phase + "_port_binding"
+        self.stage = phase + "_zero_publication"
         obj = self.inspect("container", item["id"])
-        binding_reason = loopback_binding_reason(obj, item)
+        binding_reason = zero_publication_reason(obj)
         self.binding_diagnostics.append({"stage": self.stage, "origin": "main", "reason": binding_reason,
                                          **binding_diagnostic(obj, item, net)})
-        self.check("explicit_loopback_only", binding_reason is None)
-        self.check("only_owned_network", set(obj["NetworkSettings"]["Networks"]) == {network})
+        self.check("zero_published_ports", binding_reason is None)
+        net = self.inspect("network", item["network_id"])
+        self.check("only_owned_internal_network", isolated_network_ok(obj, item, net, self.tag))
         self.stage = phase + "_resource_limits"
         limits = self.docker("exec", item["id"], "sh", "-c", "cat /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.swap.max /sys/fs/cgroup/cpu.max /sys/fs/cgroup/pids.max")[1].decode().splitlines()
         self.check("effective_resource_limits", len(limits) == 4 and limits[0] == str(MEMORY) and limits[1] == "0"
@@ -489,14 +508,31 @@ class Example:
         for _ in range(30):
             preflight.require(not self.abort.wait(1))
         self.sample()
-        listeners = self.command(["ss", "-H", "-lnt"])[1].decode().splitlines()
-        self.check("no_wildcard_listener", all(line.split()[3] == "127.0.0.1:"+str(port)
-                   for line in listeners if len(line.split()) >= 4 and line.split()[3].endswith(":"+str(port))))
-        with socket.create_connection(("127.0.0.1", port), timeout=5):
-            pass
+        self.stage = phase + "_postgres_security"
+        self.verify_postgres(item)
         self.stage = phase + "_database_create"
         self.query(item, "postgres", "CREATE DATABASE specimen;")
         return item
+
+    def verify_postgres(self, item):
+        # Return booleans about authentication; never return a password/verifier.
+        sql = """SELECT json_build_array(current_setting('listen_addresses'), host(inet_server_addr()),
+ inet_server_port(), current_user, current_database(), current_setting('password_encryption'),
+ (SELECT bool_and(auth_method='scram-sha-256') FROM pg_hba_file_rules WHERE type LIKE 'host%'),
+ NOT EXISTS(SELECT 1 FROM pg_hba_file_rules WHERE error IS NOT NULL),
+ (SELECT rolpassword LIKE 'SCRAM-SHA-256$%' FROM pg_authid WHERE rolname=current_user));"""
+        settings = json.loads(self.query(item, "postgres", sql)[1])
+        self.check("postgres_settings_readable", type(settings) is list and len(settings) == 9)
+        self.check("postgres_loopback_listening", settings[0:2] == ["127.0.0.1", "127.0.0.1"]
+                   and type(settings[2]) is int and settings[2] == 5432)
+        self.check("authenticated_sql_connection", settings[3:5] == ["postgres", "postgres"])
+        self.check("scram_authentication_required", settings[5] == "scram-sha-256"
+                   and all(value is True for value in settings[6:9]))
+        code, output = self.docker("exec", "--env", "PGPASSWORD", item["id"], "psql", "-X", "-qAt",
+                                  "--no-password", "-h", "127.0.0.1", "-U", "postgres", "-d", "postgres",
+                                  "-c", "SELECT 1;", extra={"PGPASSWORD": self.passwords[item["id"]]+"-invalid"},
+                                  failure_ok=True)
+        self.check("incorrect_password_rejected", code == 2 and output == b"")
 
     def query(self, item, database, statement, *, transaction=False, failure_ok=False):
         args = ["exec", "-i", "--env", "PGPASSWORD", item["id"], "psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1",
@@ -578,7 +614,7 @@ class Example:
         self.tools()
         self.stage = "image_verification"
         self.image()
-        source = self.database("source", 25439)
+        source = self.database("source")
         self.stage = "fixture_setup"
         self.query(source, "specimen", FIXTURE, transaction=True)
         self.check("postgres_major", 170000 <= int(self.query(source, "specimen", "SHOW server_version_num;")[1]) < 180000)
@@ -621,7 +657,7 @@ class Example:
         self.stage = "source_shutdown"
         self.stop_one(source)
         self.check("source_stopped_before_target", not self.inspect("container", source["id"])["State"]["Running"])
-        target = self.database("target", 25440)
+        target = self.database("target")
         self.stage = "restore_failure_rejection"
         restore = recovered["roles"]+recovered["sql"]
         before = time.monotonic()
